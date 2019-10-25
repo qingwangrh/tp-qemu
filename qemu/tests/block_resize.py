@@ -2,7 +2,7 @@ import logging
 import json
 
 from avocado.utils import wait
-from virttest import error_context
+from virttest import error_context, utils_misc
 from virttest import utils_numeric
 from virttest import utils_test
 from virttest import utils_disk
@@ -22,21 +22,23 @@ def run(test, params, env):
 
     1) Start guest with data disk or system disk.
     2) Do format disk in guest if needed.
-    3) Enlarge the data disk image from qemu monitor.
+    3) Record md5 of test file on the data disk.
+    Enlarge the data disk image from qemu monitor.
     4) Extend data disk partition/file-system in guest.
     5) Verify the data disk size match expected size.
     6) Reboot the guest.
-    7) Do iozone test.
+    7) Do iozone test, compare the md5 of test file.
     8) Shrink data disk partition/file-system in guest.
     9) Shrink data disk image from qemu monitor.
     10) Verify the data disk size match expected size.
     11) Reboot the guest.
-    12) Do iozone test.
+    12) Do iozone test, compare the md5 of test file.
 
     :param test: QEMU test object
     :param params: Dictionary with the test parameters
     :param env: Dictionary with test environment.
     """
+
     def verify_disk_size(session, os_type, disk):
         """
         Verify the current block size match with the expected size.
@@ -51,6 +53,24 @@ def run(test, params, env):
                          current_size, block_size)
             return True
 
+    def get_md5_of_file(filename, create_flag=False):
+        """
+        Get the md5 value of filename
+        :param filename: Name of file to get md5 value.
+        :param create_flag: This file will be created if it is True.
+        """
+        if create_flag:
+            dd_cmd = params.get("dd_cmd")
+            if os_type == 'windows':
+                dd_cmd = utils_misc.set_winutils_letter(session, dd_cmd)
+
+            guest_cmd = dd_cmd % filename
+            session.cmd(guest_cmd)
+
+        guest_cmd = md5_cmd % filename
+        md5_val = session.cmd_output(guest_cmd).split()[0]
+        return md5_val
+
     vm = env.get_vm(params["main_vm"])
     vm.verify_alive()
     timeout = float(params.get("login_timeout", 240))
@@ -61,6 +81,8 @@ def run(test, params, env):
     img_size = params.get("image_size_stg", "10G")
     mpoint = params.get("disk_letter", "C")
     disk = params.get("disk_index", 0)
+    md5_cmd = params.get("md5_cmd", "md5sum %s")
+    md5_file = params.get("md5_file", "md5.dat")
     data_image = params.get("images").split()[-1]
     data_image_params = params.object_params(data_image)
     data_image_filename = storage.get_image_filename(data_image_params,
@@ -92,6 +114,12 @@ def run(test, params, env):
     for ratio in params.objects("disk_change_ratio"):
         block_size = int(int(block_virtual_size) * float(ratio))
 
+        # Record md5
+        junction = ":\\" if os_type == 'windows' else "/"
+        md5_filename = mpoint + junction + md5_file
+        md5 = get_md5_of_file(md5_filename, True)
+        logging.debug("Got md5 %s ratio:%s on %s" % (md5, ratio, disk))
+
         # We need shrink the disk in guest first, than in monitor
         if float(ratio) < 1.0:
             error_context.context("Shrink disk size to %s in guest"
@@ -115,6 +143,9 @@ def run(test, params, env):
 
         if params.get("guest_prepare_cmd", ""):
             session.cmd(params.get("guest_prepare_cmd"))
+        # Update GPT due to size changed
+        if os_type == "linux" and labeltype == "gpt":
+            session.cmd("sgdisk -e /dev/%s" % disk)
         if params.get("need_reboot") == "yes":
             session = vm.reboot(session=session)
         if params.get("need_rescan") == "yes":
@@ -152,4 +183,9 @@ def run(test, params, env):
                 io_test.run(iozone_cmd_options, iozone_timeout)
             finally:
                 io_test.clean()
+
+        # Verify md5
+        new_md5 = get_md5_of_file(md5_filename)
+        test.assertTrue(new_md5 == md5, "Unexpected md5 value: %s" % new_md5)
+
     session.close()
